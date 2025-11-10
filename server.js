@@ -1,28 +1,38 @@
 // server.js
+// Corrected and simplified Slack Bolt + Postgres example
 const { App, ExpressReceiver } = require('@slack/bolt');
-const express = require('express');
 const { Pool } = require('pg');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-// Render/Heroku-style single process: use ExpressReceiver to share express app
+if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET || !DATABASE_URL) {
+  console.error('Missing required environment variables. Set SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET and DATABASE_URL.');
+  process.exit(1);
+}
+
+// Create an ExpressReceiver for Bolt
 const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET
+  signingSecret: SLACK_SIGNING_SECRET,
+  // By default Bolt mounts at /slack/events. If you need a different path set "endpoints"
 });
 
-// Create the Bolt App using the receiver (it will use the existing express instance)
+// Create the Bolt App using the receiver
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
+  token: SLACK_BOT_TOKEN,
   receiver
 });
 
 // Postgres pool — Render provides DATABASE_URL env var
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
+  // Render requires this in production; if not needed in your dev env you can remove
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Ensure tasks table exists
+// Initialize DB table
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
@@ -37,13 +47,15 @@ async function initDB() {
     );
   `);
 }
-initDB().catch(err => console.error('DB init error', err));
+initDB().catch(err => {
+  console.error('DB init failed', err);
+  process.exit(1);
+});
 
-// ------------------ Slash command /addtask ------------------
+// ------------------ /addtask command ------------------
 app.command('/addtask', async ({ ack, body, client }) => {
-  await ack();
+  await ack(); // acknowledge immediately
 
-  // Open a modal for the user to enter task and date — view_id not required
   try {
     await client.views.open({
       trigger_id: body.trigger_id,
@@ -70,42 +82,51 @@ app.command('/addtask', async ({ ack, body, client }) => {
       }
     });
   } catch (err) {
-    console.error('open modal error', err);
+    console.error('Error opening addtask modal:', err);
   }
 });
 
-// Handle submission of add_task_view
 app.view('add_task_view', async ({ ack, view, body, client }) => {
   await ack();
-  const user = body.user.id;
-  const task = view.state.values.task_block.task_input.value;
-  const dueDate = view.state.values.date_block.date_input.value;
-  const channel = view.private_metadata || null;
 
-  // Save to DB
-  try {
-    await pool.query('INSERT INTO tasks (user_id, task_text, due_date, created_by, channel_id) VALUES ($1,$2,$3,$4,$5)',
-      [user, task, dueDate, user, channel]);
-  } catch (err) {
-    console.error('DB insert error', err);
+  const user = body.user.id;
+  const taskText = view.state.values?.task_block?.task_input?.value || '';
+  const dueDateRaw = view.state.values?.date_block?.date_input?.value || '';
+
+  // Basic validation for date (YYYY-MM-DD)
+  if (!taskText || !/^\d{4}-\d{2}-\d{2}$/.test(dueDateRaw)) {
+    try {
+      await client.chat.postEphemeral({
+        channel: user,
+        user,
+        text: 'Task not saved. Ensure you provided a task and date in YYYY-MM-DD format.'
+      });
+    } catch (e) { console.error('error sending ephemeral', e); }
+    return;
   }
 
-  // Optionally notify user
   try {
+    await pool.query(
+      `INSERT INTO tasks (user_id, task_text, due_date, created_by) VALUES ($1,$2,$3,$4)`,
+      [user, taskText, dueDateRaw, user]
+    );
+
     await client.chat.postMessage({
       channel: user,
-      text: `✅ Your task was saved:\n*${task}*\nDue: ${dueDate}`
+      text: `✅ Your task was saved:\n*${taskText}*\nDue: ${dueDateRaw}`
     });
   } catch (err) {
-    console.error('DM user error', err);
+    console.error('DB insert or DM error', err);
+    try {
+      await client.chat.postEphemeral({ channel: user, user, text: 'Failed to save task (server error).' });
+    } catch (e) { console.error('ephemeral send failed', e); }
   }
 });
 
-// ------------------ Slash command /reminduser ------------------
+// ------------------ /reminduser command ------------------
 app.command('/reminduser', async ({ ack, body, client }) => {
   await ack();
 
-  // Open modal for CEO to select a user and then task (task list will be loaded via external options)
   try {
     await client.views.open({
       trigger_id: body.trigger_id,
@@ -133,8 +154,7 @@ app.command('/reminduser', async ({ ack, body, client }) => {
               type: 'external_select',
               action_id: 'task_select',
               placeholder: { type: 'plain_text', text: 'Search tasks (select a user first)' }
-            },
-            optional: false
+            }
           },
           {
             type: 'input',
@@ -155,18 +175,19 @@ app.command('/reminduser', async ({ ack, body, client }) => {
   }
 });
 
-// Provide dynamic options for the task_select external_select
-// Bolt uses app.options to respond to options requests
-app.options('task_select', async ({ options, ack, body }) => {
-  // Expect the modal's state to contain selected user — Slack sends the current view state in body
+// ------------------ options handler for external_select ------------------
+// Slack will call this endpoint to get options for 'task_select'.
+// We look into the view state to find which user is selected.
+app.options('task_select', async ({ ack, body }) => {
   try {
-    // Find the selected user id in the current view state (if present)
+    // Defensive: find selected user in body.view.state.values if available
     let selectedUser;
-    if (body.view && body.view.state) {
-      const vs = body.view.state.values;
-      for (const blk in vs) {
-        for (const inner in vs[blk]) {
-          const val = vs[blk][inner];
+    if (body.view && body.view.state && body.view.state.values) {
+      const values = body.view.state.values;
+      for (const blockId of Object.keys(values)) {
+        const block = values[blockId];
+        for (const actionId of Object.keys(block)) {
+          const val = block[actionId];
           if (val && val.type === 'users_select' && val.selected_user) {
             selectedUser = val.selected_user;
             break;
@@ -177,77 +198,95 @@ app.options('task_select', async ({ options, ack, body }) => {
     }
 
     if (!selectedUser) {
-      // Return an empty list with a helpful message
+      // Ask the user to pick a user first
       await ack({
         options: [
-          { text: { type: 'plain_text', text: 'Pick a user first' }, value: 'no_user' }
+          { text: { type: 'plain_text', text: 'Please select a user first' }, value: 'no_user' }
         ]
       });
       return;
     }
 
-    // Query tasks for the selected user (only incomplete ones)
-    const res = await pool.query('SELECT id, task_text, due_date FROM tasks WHERE user_id=$1 AND completed = false ORDER BY due_date ASC LIMIT 50', [selectedUser]);
-    const optionsList = res.rows.map(r => {
-      const label = `${r.task_text} — due ${r.due_date.toISOString().slice(0,10)}`;
-      return { text: { type: 'plain_text', text: label.slice(0,75) }, value: String(r.id) };
+    // Query tasks for user
+    const res = await pool.query(
+      `SELECT id, task_text, due_date FROM tasks WHERE user_id=$1 AND completed = false ORDER BY due_date ASC LIMIT 50`,
+      [selectedUser]
+    );
+
+    if (res.rowCount === 0) {
+      await ack({
+        options: [
+          { text: { type: 'plain_text', text: 'No tasks found for that user' }, value: 'no_tasks' }
+        ]
+      });
+      return;
+    }
+
+    const options = res.rows.map(r => {
+      // format due_date to YYYY-MM-DD (safe even if it's a string)
+      const due = (r.due_date instanceof Date) ? r.due_date.toISOString().slice(0, 10) : String(r.due_date);
+      const label = `${r.task_text}`.length > 75 ? `${r.task_text.slice(0,72)}...` : r.task_text;
+      const text = `${label} — due ${due}`;
+      return { text: { type: 'plain_text', text }, value: String(r.id) };
     });
 
-    if (optionsList.length === 0) {
-      await ack({
-        options: [
-          { text: { type: 'plain_text', text: 'No tasks for that user' }, value: 'no_tasks' }
-        ]
-      });
-      return;
-    }
-
-    await ack({ options: optionsList });
+    await ack({ options });
   } catch (err) {
     console.error('options handler error', err);
-    await ack({ options: [{ text: { type: 'plain_text', text: 'Error loading tasks' }, value: 'err' }]});
+    await ack({
+      options: [
+        { text: { type: 'plain_text', text: 'Error loading tasks' }, value: 'err' }
+      ]
+    });
   }
 });
 
-// Handle view submission for sending reminder
+// ------------------ handle reminder submission ------------------
 app.view('send_reminder_view', async ({ ack, view, body, client }) => {
   await ack();
 
   const ceo = body.user.id;
-  const userSelect = view.state.values.user_select_block.user_select.selected_user;
-  const taskId = view.state.values.task_select_block.task_select.selected_option && view.state.values.task_select_block.task_select.selected_option.value;
-  const customMsg = view.state.values.custom_message_block && view.state.values.custom_message_block.custom_message.value;
 
-  // Fetch task text & due date
+  const userSelected = view.state.values?.user_select_block?.user_select?.selected_user;
+  const taskOption = view.state.values?.task_select_block?.task_select?.selected_option;
+  const taskId = taskOption ? taskOption.value : null;
+  const customMsg = view.state.values?.custom_message_block?.custom_message?.value || '';
+
+  if (!userSelected || !taskId) {
+    try {
+      await client.chat.postEphemeral({ channel: ceo, user: ceo, text: 'Please select both a user and a task.' });
+    } catch (e) { console.error('ephemeral send failed', e); }
+    return;
+  }
+
   try {
-    const res = await pool.query('SELECT * FROM tasks WHERE id=$1', [taskId]);
+    const res = await pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
     if (res.rowCount === 0) {
-      await client.chat.postEphemeral({ channel: ceo, user: ceo, text: 'Task not found.' });
+      await client.chat.postEphemeral({ channel: ceo, user: ceo, text: 'Task not found (may have been deleted).' });
       return;
     }
     const task = res.rows[0];
+    const due = task.due_date instanceof Date ? task.due_date.toISOString().slice(0, 10) : String(task.due_date);
 
-    // Construct message
-    const text = `🔔 *Reminder* about your task:\n*${task.task_text}*\nDue: ${task.due_date.toISOString().slice(0,10)}\n\n${customMsg || ''}`;
+    const text = `🔔 *Reminder* about your task:\n*${task.task_text}*\nDue: ${due}\n\n${customMsg || ''}`;
 
-    // DM the user
-    await client.chat.postMessage({ channel: userSelect, text, mrkdwn: true });
+    await client.chat.postMessage({ channel: userSelected, text, mrkdwn: true });
 
-    // Optional: send confirmation to CEO
-    await client.chat.postEphemeral({ channel: ceo, user: ceo, text: `Reminder sent to <@${userSelect}> for task id ${taskId}.` });
-
+    await client.chat.postEphemeral({ channel: ceo, user: ceo, text: `Reminder sent to <@${userSelected}> for task id ${taskId}.` });
   } catch (err) {
     console.error('send reminder error', err);
-    await client.chat.postEphemeral({ channel: ceo, user: ceo, text: `Failed to send reminder: ${err.message}` });
+    try {
+      await client.chat.postEphemeral({ channel: ceo, user: ceo, text: 'Failed to send reminder (server error).' });
+    } catch (e) { console.error('ephemeral error', e); }
   }
 });
 
-// Start express server (Bolt's receiver has an express app we can use)
+// Root route for quick health check
 receiver.app.get('/', (req, res) => {
-  res.send('Slack reminder bot running.');
+  res.send('Slack reminder bot is running.');
 });
 
-(async () => {
-  await app.start(PORT);
-  console.log(`⚡️ Slack Bolt app is running on port ${PORT}`);
-})();
+// Start the HTTP server using the receiver's express app
+receiver.app.listen(PORT, () => {
+  console.log(`⚡️ Slack Bolt receiver listening on port ${PORT}`);
+});
